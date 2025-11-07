@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package weather;
+option java_package = "org.example.weather";
+option java_outer_classname = "WeatherOuterClass";
+option go_package = "github.com/ismail/weatherapp/weather;weather";
+
+
+message WeatherData {
+    float temperature = 1;
+    float humidity = 2;
+    float pressure = 3;
+    int64 timestamp = 4;
+}
+
+message WeatherStats {
+    float avg_temperature = 1;
+    float avg_humidity = 2;
+    float avg_pressure = 3;
+    int64 samples_count = 4;
+}
+
+message AlertMessage {
+    string type = 1;
+    string message = 2;
+}
+
+message AuthMetadata {
+    string token = 1;
+}
+
+message Empty {}
+
+
+service WeatherSensorService {
+
+    rpc StreamWeatherData(stream WeatherData) returns (WeatherStats);
+}
+
+
+service AnalyticsService {
+    rpc CollectWeatherData(stream WeatherData) returns (WeatherStats);
+
+    rpc StreamAnalytics(Empty) returns (stream WeatherStats);
+
+    rpc GetLastReport(Empty) returns (WeatherStats);
+}
+
+service DashboardService {
+    rpc ReceiveLiveUpdates(Empty) returns (stream WeatherStats);
+
+    rpc RequestReport(Empty) returns (WeatherStats);
+}
