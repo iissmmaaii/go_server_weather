@@ -6,91 +6,139 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
+	"time"
 
-	"github.com/ismail/weatherapp/analytics/weather"
+	"github.com/ismail/weatherapp/weather"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+)
+
+const (
+	port          = ":5051"
+	expectedToken = "MY_SECRET_TOKEN"
 )
 
 type server struct {
 	weather.UnimplementedAnalyticsServiceServer
-	data []*weather.WeatherData
+	mu        sync.RWMutex
+	data      []*weather.WeatherData
+	lastStats *weather.WeatherStats
 }
 
-func (s *server) CollectWeatherData(stream grpc.ClientStreamingServer[weather.WeatherData, weather.WeatherStats]) error {
-	var sumTemp, sumHum, sumPres float32
-	count := 0
+func newServer() *server {
+	return &server{data: []*weather.WeatherData{}}
+}
+
+func computeStats(samples []*weather.WeatherData) *weather.WeatherStats {
+	var sumT, sumH, sumP float32
+	var count int64
+	for _, s := range samples {
+		sumT += s.Temperature
+		sumH += s.Humidity
+		sumP += s.Pressure
+		count++
+	}
+	if count == 0 {
+		return &weather.WeatherStats{}
+	}
+	return &weather.WeatherStats{
+		AvgTemperature: sumT / float32(count),
+		AvgHumidity:    sumH / float32(count),
+		AvgPressure:    sumP / float32(count),
+		SamplesCount:   count,
+	}
+}
+
+func (s *server) CollectWeatherData(stream weather.AnalyticsService_CollectWeatherDataServer) error {
+	md, ok := metadata.FromIncomingContext(stream.Context())
+	if !ok {
+		return status.Error(codes.Unauthenticated, "missing metadata")
+	}
+	tokens := md.Get("token")
+	if len(tokens) == 0 || tokens[0] != expectedToken {
+		return status.Error(codes.Unauthenticated, "invalid token")
+	}
+
+	log.Println(" Client connected: token OK")
 
 	for {
 		wd, err := stream.Recv()
 		if err == io.EOF {
-			break
+			s.mu.RLock()
+			stats := s.lastStats
+			s.mu.RUnlock()
+			return stream.SendAndClose(stats)
 		}
 		if err != nil {
-			return status.Errorf(codes.Internal, "failed to receive data: %v", err)
+			return err
 		}
 
-		if wd.Temperature > 100 {
-			return status.Errorf(codes.InvalidArgument, "Temperature too high")
+		if wd.Temperature > 45 {
+			return status.Errorf(codes.OutOfRange, "Temperature too high: %.2f°C", wd.Temperature)
+		}
+		if wd.Humidity < 10 {
+			return status.Errorf(codes.OutOfRange, "Humidity too low: %.2f%%", wd.Humidity)
+		}
+		if wd.Pressure < 950 || wd.Pressure > 1050 {
+			return status.Errorf(codes.OutOfRange, "Pressure out of range: %.2f hPa", wd.Pressure)
 		}
 
-		sumTemp += wd.Temperature
-		sumHum += wd.Humidity
-		sumPres += wd.Pressure
-		count++
+		s.mu.Lock()
 		s.data = append(s.data, wd)
-	}
+		s.lastStats = computeStats(s.data)
+		s.mu.Unlock()
 
-	stats := &weather.WeatherStats{
-		AvgTemperature: sumTemp / float32(count),
-		AvgHumidity:    sumHum / float32(count),
-		AvgPressure:    sumPres / float32(count),
-		SamplesCount:   int64(count),
+		log.Println("Received data:", wd)
 	}
-
-	return stream.SendAndClose(stats)
 }
 
 func (s *server) StreamAnalytics(_ *weather.Empty, stream weather.AnalyticsService_StreamAnalyticsServer) error {
-	for _, wd := range s.data {
-		stats := &weather.WeatherStats{
-			AvgTemperature: wd.Temperature,
-			AvgHumidity:    wd.Humidity,
-			AvgPressure:    wd.Pressure,
-			SamplesCount:   1,
-		}
-		if err := stream.Send(stats); err != nil {
-			return err
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	log.Println("Dashboard connected")
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			log.Println("Dashboard disconnected")
+			return nil
+		case <-ticker.C:
+			s.mu.RLock()
+			stats := s.lastStats
+			s.mu.RUnlock()
+			if stats != nil {
+				if err := stream.Send(stats); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	return nil
 }
 
 func (s *server) GetLastReport(ctx context.Context, _ *weather.Empty) (*weather.WeatherStats, error) {
-	if len(s.data) == 0 {
-		return nil, status.Error(codes.NotFound, "No data yet")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastStats == nil {
+		return nil, status.Error(codes.NotFound, "no stats yet")
 	}
-	last := s.data[len(s.data)-1]
-	return &weather.WeatherStats{
-		AvgTemperature: last.Temperature,
-		AvgHumidity:    last.Humidity,
-		AvgPressure:    last.Pressure,
-		SamplesCount:   1,
-	}, nil
+	return s.lastStats, nil
 }
 
 func main() {
-	lis, err := net.Listen("tcp", ":50051")
+	lis, err := net.Listen("tcp", port)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	s := grpc.NewServer()
-	weather.RegisterAnalyticsServiceServer(s, &server{})
-	fmt.Println("Analytics Service running on port 50051...")
+	grpcServer := grpc.NewServer()
+	srv := newServer()
+	weather.RegisterAnalyticsServiceServer(grpcServer, srv)
 
-	if err := s.Serve(lis); err != nil {
+	fmt.Println(" Analytics Service running on 10.84.77.209:5051")
+	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
 }
